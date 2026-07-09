@@ -2,6 +2,8 @@
 #
 # Authenticates, fetches all accounts the API user has access to,
 # and retrieves the password for each account where permitted.
+# Token is automatically refreshed every 15 minutes to prevent
+# cakwt001E invalid JWT token errors on long-running executions.
 #
 # IMPORTANT: Output CSV contains plaintext passwords — protect and delete after use.
 
@@ -16,39 +18,49 @@ $Subdomain         = "XXXXXXXXXXXXXXXXXXXXXX"
 $IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
 $PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
 
+# Token refresh interval in minutes — refresh before the token expires
+$TokenRefreshMinutes = 15
+
 # ---------------------------------------------------------------------------
 # OUTPUT SETUP
 # ---------------------------------------------------------------------------
-$Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$OutputDir  = ".\CyberArkPasswords_$Timestamp"
-$OutputCsv  = "$OutputDir\Accounts_Passwords_$Timestamp.csv"
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$OutputDir = ".\CyberArkPasswords_$Timestamp"
+$OutputCsv = "$OutputDir\Accounts_Passwords_$Timestamp.csv"
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 # ---------------------------------------------------------------------------
 # AUTHENTICATION
+# Shared function used for initial auth and mid-run token refresh
 # ---------------------------------------------------------------------------
-try {
-    $TokenResponse = Invoke-RestMethod `
-        -Uri "$IdentityUrl/oauth2/platformtoken" `
-        -Method POST `
-        -Body @{
-            grant_type    = "client_credentials"
-            client_id     = $ServiceUserId
-            client_secret = $ServiceUserSecret
-        } `
-        -ContentType "application/x-www-form-urlencoded" `
-        -ErrorAction Stop
+function Get-AuthHeaders {
+    try {
+        $Resp = Invoke-RestMethod `
+            -Uri "$IdentityUrl/oauth2/platformtoken" `
+            -Method POST `
+            -Body @{
+                grant_type    = "client_credentials"
+                client_id     = $ServiceUserId
+                client_secret = $ServiceUserSecret
+            } `
+            -ContentType "application/x-www-form-urlencoded" `
+            -ErrorAction Stop
 
-    $Headers = @{
-        Authorization  = "Bearer $($TokenResponse.access_token)"
-        "Content-Type" = "application/json"
+        $script:TokenIssuedAt = Get-Date
+        Write-Host "Token issued at $($script:TokenIssuedAt.ToString('HH:mm:ss'))" -ForegroundColor Green
+        return @{
+            Authorization  = "Bearer $($Resp.access_token)"
+            "Content-Type" = "application/json"
+        }
+    } catch {
+        Write-Host "Authentication failed: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
     }
-    Write-Host "Authentication successful" -ForegroundColor Green
-} catch {
-    Write-Host "Authentication failed: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
 }
+
+$Headers      = Get-AuthHeaders
+$TokenIssuedAt = Get-Date
 
 # ---------------------------------------------------------------------------
 # FETCH ALL ACCOUNTS (PAGINATED)
@@ -69,10 +81,18 @@ Write-Host "Accounts found: $($AllAccounts.Count)" -ForegroundColor Cyan
 
 # ---------------------------------------------------------------------------
 # RETRIEVE PASSWORDS
+# Refreshes token automatically if more than $TokenRefreshMinutes have passed
 # ---------------------------------------------------------------------------
 $Rows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 foreach ($Acc in $AllAccounts) {
+
+    # Refresh token if it is approaching expiry
+    if ((Get-Date) -gt $TokenIssuedAt.AddMinutes($TokenRefreshMinutes)) {
+        Write-Host "Token age exceeded ${TokenRefreshMinutes}min — refreshing" -ForegroundColor Cyan
+        $Headers = Get-AuthHeaders
+    }
+
     $Password = ""
     $Status   = ""
 
@@ -84,7 +104,7 @@ foreach ($Acc in $AllAccounts) {
             -Body "{}" `
             -ErrorAction Stop
         $Status = "Retrieved"
-        Write-Host "Retrieved: $($Acc.name) | $($Acc.safeName)" -ForegroundColor Green
+        Write-Host "Retrieved  : $($Acc.name) | $($Acc.safeName)" -ForegroundColor Green
     } catch {
         $StatusCode = $null
         if ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
@@ -93,15 +113,15 @@ foreach ($Acc in $AllAccounts) {
     }
 
     $Rows.Add([PSCustomObject]@{
-        AccountID    = $Acc.id
-        AccountName  = $Acc.name
-        UserName     = $Acc.userName
-        Address      = $Acc.address
-        PlatformID   = $Acc.platformId
-        SafeName     = $Acc.safeName
-        CPMStatus    = $Acc.secretManagement.status
-        Status       = $Status
-        Password     = $Password
+        AccountID   = $Acc.id
+        AccountName = $Acc.name
+        UserName    = $Acc.userName
+        Address     = $Acc.address
+        PlatformID  = $Acc.platformId
+        SafeName    = $Acc.safeName
+        CPMStatus   = $Acc.secretManagement.status
+        Status      = $Status
+        Password    = $Password
     })
 }
 
