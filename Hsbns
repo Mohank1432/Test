@@ -1,0 +1,423 @@
+# CyberArk_AccountPasswordRetrieval.ps1
+#
+# Retrieves account information, safe information, and passwords for all accounts
+# the API service user has permission to access.
+#
+# Password retrieval is attempted via POST /Accounts/{ID}/Password/Retrieve/ per account.
+# Accounts where the API user lacks retrieveAccounts permission return HTTP 403 and are
+# marked as "NoPermission" — they are not treated as errors and do not stop execution.
+# Accounts behind dual-control approval workflows return HTTP 403 and are marked
+# as "DualControlRequired".
+#
+# IMPORTANT: The output CSV contains plaintext passwords.
+# Protect the output folder accordingly — delete files after use.
+#
+# What this script produces:
+#   AccountRetrieval_Summary_<timestamp>.csv — One row per account:
+#                                              all account fields + safe fields + retrieved password
+#   AccountRetrieval_Log_<timestamp>.log     — Full verbose log of every action and API call
+#
+# What the API user needs:
+#   - listAccounts permission on each safe to see accounts
+#   - retrieveAccounts permission on each safe to retrieve passwords
+#   Accounts in safes where the user has listAccounts but not retrieveAccounts
+#   will appear in the CSV with Status = NoPermission and a blank password.
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+$IdentityTenantId  = "XXXXXXXXXXXXX"
+$ServiceUserId     = "XXXXXXXXXXXXXXXX@cyberark.cloud.XXXXXXXXXXXX"
+$ServiceUserSecret = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+$Subdomain         = "XXXXXXXXXXXXXXXXXXXXXX"
+
+# Optional: reason string sent with each password retrieval request.
+# Leave empty if your platform does not require a reason.
+$RetrieveReason    = ""
+
+$IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
+$PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
+
+# ---------------------------------------------------------------------------
+# SYSTEM SAFES — excluded from all processing
+# ---------------------------------------------------------------------------
+$SystemSafes = @(
+    "VaultInternal", "Notification Engine", "SharedAuth_Internal",
+    "PVWAConfig", "PVWAPrivateUserPrefs", "PVWAPublicData",
+    "PVWAReports", "PVWATaskDefinitions", "PVWAUserPrefs",
+    "PasswordManager", "PasswordManager_Pending", "PasswordManagerTemp",
+    "PasswordManager_workspace", "PasswordManager_ADInternal",
+    "AccountsFeedADAccounts", "AccountsFeedDiscoveryLogs"
+)
+
+# ---------------------------------------------------------------------------
+# OUTPUT SETUP
+# ---------------------------------------------------------------------------
+$Timestamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+$OutputDir   = ".\CyberArkAccountRetrieval_$Timestamp"
+$LogFile     = "$OutputDir\AccountRetrieval_Log_$Timestamp.log"
+$SummaryCsv  = "$OutputDir\AccountRetrieval_Summary_$Timestamp.csv"
+
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+
+# ---------------------------------------------------------------------------
+# RETRY SETTINGS
+# ---------------------------------------------------------------------------
+$MaxRetries       = 2
+$RetryWaitSeconds = 5
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR","SUCCESS","DEBUG","SECTION")]
+        [string]$Level = "INFO"
+    )
+    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] [$Level] $Message"
+    Add-Content -Path $LogFile -Value $line
+    switch ($Level) {
+        "INFO"    { Write-Host $line -ForegroundColor Cyan }
+        "WARN"    { Write-Host $line -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $line -ForegroundColor Red }
+        "SUCCESS" { Write-Host $line -ForegroundColor Green }
+        "DEBUG"   { Write-Host $line -ForegroundColor DarkGray }
+        "SECTION" { Write-Host "`n$line`n" -ForegroundColor Magenta }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# API GET WITH RETRY
+# ---------------------------------------------------------------------------
+function Invoke-ApiGet {
+    param([string]$Uri, [hashtable]$Headers)
+    $attempt = 0
+    while ($attempt -le $MaxRetries) {
+        $attempt++
+        try {
+            Write-Log "GET $Uri (attempt $attempt)" -Level DEBUG
+            return Invoke-RestMethod -Uri $Uri -Method GET -Headers $Headers -ErrorAction Stop
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            $msg = $_.Exception.Message
+            if ($statusCode -in @(400, 401, 403, 404)) {
+                Write-Log "GET $Uri - HTTP $statusCode - $msg (no retry)" -Level ERROR
+                return $null
+            }
+            if ($attempt -le $MaxRetries) {
+                Write-Log "GET $Uri - HTTP $statusCode - $msg (retrying in ${RetryWaitSeconds}s...)" -Level WARN
+                Start-Sleep -Seconds $RetryWaitSeconds
+            } else {
+                Write-Log "GET $Uri - HTTP $statusCode - $msg (all retries exhausted)" -Level ERROR
+                return $null
+            }
+        }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# API POST WITH RETRY — returns raw response string for password retrieve calls
+# ---------------------------------------------------------------------------
+function Invoke-ApiPost {
+    param([string]$Uri, [hashtable]$Headers, [string]$Body = "{}")
+    $attempt = 0
+    while ($attempt -le $MaxRetries) {
+        $attempt++
+        try {
+            Write-Log "POST $Uri (attempt $attempt)" -Level DEBUG
+            return Invoke-RestMethod `
+                -Uri $Uri `
+                -Method POST `
+                -Headers $Headers `
+                -Body $Body `
+                -ErrorAction Stop
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            $msg = $_.Exception.Message
+
+            # 403 — no permission or dual control required — do not retry, return status code
+            # so the caller can distinguish from other failures
+            if ($statusCode -eq 403) {
+                Write-Log "POST $Uri - HTTP 403 - $msg (no retry)" -Level DEBUG
+                return "HTTP_403"
+            }
+            if ($statusCode -in @(400, 401, 404)) {
+                Write-Log "POST $Uri - HTTP $statusCode - $msg (no retry)" -Level ERROR
+                return $null
+            }
+            if ($attempt -le $MaxRetries) {
+                Write-Log "POST $Uri - HTTP $statusCode - $msg (retrying in ${RetryWaitSeconds}s...)" -Level WARN
+                Start-Sleep -Seconds $RetryWaitSeconds
+            } else {
+                Write-Log "POST $Uri - HTTP $statusCode - $msg (all retries exhausted)" -Level ERROR
+                return $null
+            }
+        }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# SAFE URL BUILDER
+# Appends trailing slash if safe name contains a dot — required by API URL rules
+# ---------------------------------------------------------------------------
+function Get-SafeUrl {
+    param([string]$SafeName)
+    $encoded = [Uri]::EscapeDataString($SafeName)
+    if ($SafeName -match '\.') { return "$encoded/" }
+    return $encoded
+}
+
+# ---------------------------------------------------------------------------
+# AUTHENTICATION
+# ---------------------------------------------------------------------------
+Write-Log "CyberArk Account Password Retrieval started" -Level SECTION
+Write-Log "Output directory: $OutputDir" -Level INFO
+Write-Log "Authenticating via OAuth2 client_credentials" -Level INFO
+
+try {
+    $AuthBody = @{
+        grant_type    = "client_credentials"
+        client_id     = $ServiceUserId
+        client_secret = $ServiceUserSecret
+    }
+    $TokenResponse = Invoke-RestMethod `
+        -Uri "$IdentityUrl/oauth2/platformtoken" `
+        -Method POST `
+        -Body $AuthBody `
+        -ContentType "application/x-www-form-urlencoded" `
+        -ErrorAction Stop
+
+    $Token = $TokenResponse.access_token
+    $Headers = @{
+        Authorization  = "Bearer $Token"
+        "Content-Type" = "application/json"
+    }
+    Write-Log "Authentication successful" -Level SUCCESS
+} catch {
+    Write-Log "Authentication failed: $($_.Exception.Message)" -Level ERROR
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# STEP 1 — FETCH ALL SAFES (PAGINATED)
+# Build a lookup dictionary: SafeName -> safe object
+# Used to enrich each account row with its safe's metadata
+# ---------------------------------------------------------------------------
+Write-Log "Fetching all safes" -Level SECTION
+
+$SafeLookup = @{}
+$Offset     = 0
+$Limit      = 100
+$TotalSafes = 0
+$SkippedSystemSafes = 0
+
+do {
+    $Resp  = Invoke-ApiGet -Uri "$PvwaBase/Safes?limit=$Limit&offset=$Offset" -Headers $Headers
+    $Batch = $Resp.value
+
+    if (-not $Batch) { break }
+
+    foreach ($Safe in $Batch) {
+        if ($SystemSafes -contains $Safe.safeName) {
+            $SkippedSystemSafes++
+            continue
+        }
+        $SafeLookup[$Safe.safeName] = $Safe
+        $TotalSafes++
+    }
+
+    Write-Log "Fetched $($Batch.Count) safes at offset $Offset (non-system running total: $TotalSafes)" -Level DEBUG
+    $Offset += $Limit
+
+} while ($Batch.Count -eq $Limit)
+
+Write-Log "Safes loaded into lookup: $TotalSafes  System safes skipped: $SkippedSystemSafes" -Level SUCCESS
+
+# ---------------------------------------------------------------------------
+# STEP 2 — FETCH ALL ACCOUNTS (PAGINATED)
+# ---------------------------------------------------------------------------
+Write-Log "Fetching all accounts" -Level SECTION
+
+$AllAccounts = [System.Collections.Generic.List[PSCustomObject]]::new()
+$AccOffset   = 0
+$AccLimit    = 100
+
+do {
+    $AccResp = Invoke-ApiGet -Uri "$PvwaBase/Accounts?limit=$AccLimit&offset=$AccOffset" -Headers $Headers
+
+    if (-not $AccResp) {
+        Write-Log "Accounts fetch returned null at offset $AccOffset — stopping pagination" -Level WARN
+        break
+    }
+
+    $Batch = $AccResp.value
+    if (-not $Batch) { break }
+
+    foreach ($Acc in $Batch) {
+        # Skip accounts whose safe is a system safe
+        if ($SystemSafes -contains $Acc.safeName) { continue }
+        $AllAccounts.Add($Acc)
+    }
+
+    Write-Log "Fetched $($Batch.Count) accounts at offset $AccOffset (running total: $($AllAccounts.Count))" -Level DEBUG
+    $AccOffset += $AccLimit
+
+} while ($Batch.Count -eq $AccLimit)
+
+Write-Log "Total accounts to process: $($AllAccounts.Count)" -Level SUCCESS
+
+# ---------------------------------------------------------------------------
+# STEP 3 — RETRIEVE PASSWORDS AND BUILD OUTPUT ROWS
+# ---------------------------------------------------------------------------
+Write-Log "Retrieving passwords" -Level SECTION
+
+$SummaryRows     = [System.Collections.Generic.List[PSCustomObject]]::new()
+$CountSuccess    = 0
+$CountNoPermission = 0
+$CountDualControl  = 0
+$CountFailed       = 0
+
+# Build the retrieve request body — includes reason if provided
+$RetrieveBody = if ($RetrieveReason -ne "") {
+    @{ reason = $RetrieveReason } | ConvertTo-Json -Depth 2
+} else {
+    "{}"
+}
+
+foreach ($Acc in $AllAccounts) {
+    $AccId       = $Acc.id
+    $AccName     = $Acc.name
+    $AccSafeName = $Acc.safeName
+    $AccAddress  = $Acc.address
+    $AccUserName = $Acc.userName
+    $AccPlatform = $Acc.platformId
+    $AccSecretType = $Acc.secretType
+
+    # Format timestamps from Unix epoch
+    $CreatedTime      = if ($Acc.createdTime) {
+        [DateTimeOffset]::FromUnixTimeSeconds($Acc.createdTime).ToString("yyyy-MM-dd HH:mm:ss")
+    } else { "" }
+
+    $LastModifiedTime = if ($Acc.secretManagement.lastModifiedTime) {
+        [DateTimeOffset]::FromUnixTimeSeconds($Acc.secretManagement.lastModifiedTime).ToString("yyyy-MM-dd HH:mm:ss")
+    } else { "" }
+
+    $LastVerifiedTime = if ($Acc.secretManagement.lastVerifiedTime) {
+        [DateTimeOffset]::FromUnixTimeSeconds($Acc.secretManagement.lastVerifiedTime).ToString("yyyy-MM-dd HH:mm:ss")
+    } else { "" }
+
+    $LastReconciledTime = if ($Acc.secretManagement.lastReconciledTime) {
+        [DateTimeOffset]::FromUnixTimeSeconds($Acc.secretManagement.lastReconciledTime).ToString("yyyy-MM-dd HH:mm:ss")
+    } else { "" }
+
+    # Enrich with safe metadata from lookup
+    $Safe = $SafeLookup[$AccSafeName]
+    $SafeDescription     = if ($Safe) { $Safe.description }            else { "" }
+    $SafeManagingCPM     = if ($Safe) { $Safe.managingCPM }            else { "" }
+    $SafeLocation        = if ($Safe) { $Safe.location }               else { "" }
+    $SafeOlacEnabled     = if ($Safe) { $Safe.olacEnabled }            else { "" }
+    $SafeRetentionDays   = if ($Safe) { $Safe.numberOfDaysRetention }  else { "" }
+    $SafeAutoPurge       = if ($Safe) { $Safe.autoPurgeEnabled }       else { "" }
+    $SafeCreatorName     = if ($Safe) { $Safe.creator.name }           else { "" }
+
+    # Attempt password retrieval
+    $RetrieveUri  = "$PvwaBase/Accounts/$AccId/Password/Retrieve/"
+    $RetrieveResp = Invoke-ApiPost -Uri $RetrieveUri -Headers $Headers -Body $RetrieveBody
+
+    $Password     = ""
+    $Status       = ""
+
+    if ($RetrieveResp -eq "HTTP_403") {
+        # 403 can mean no retrieveAccounts permission OR dual-control approval required.
+        # Attempt to distinguish by checking the account's secretManagement status.
+        if ($Acc.secretManagement.status -eq "needsApproval") {
+            $Status = "DualControlRequired"
+            $CountDualControl++
+            Write-Log "DualControlRequired: $AccName (ID: $AccId  Safe: $AccSafeName)" -Level WARN
+        } else {
+            $Status = "NoPermission"
+            $CountNoPermission++
+            Write-Log "NoPermission: $AccName (ID: $AccId  Safe: $AccSafeName)" -Level DEBUG
+        }
+    } elseif ($null -eq $RetrieveResp) {
+        $Status = "Failed"
+        $CountFailed++
+        Write-Log "Failed to retrieve password: $AccName (ID: $AccId  Safe: $AccSafeName)" -Level ERROR
+    } else {
+        # Password returned as a plain string
+        $Password = $RetrieveResp
+        $Status   = "Retrieved"
+        $CountSuccess++
+        Write-Log "Retrieved: $AccName (ID: $AccId  Safe: $AccSafeName)" -Level SUCCESS
+    }
+
+    $SummaryRows.Add([PSCustomObject]@{
+
+        # Account identity
+        AccountID                  = $AccId
+        AccountName                = $AccName
+        UserName                   = $AccUserName
+        Address                    = $AccAddress
+        PlatformID                 = $AccPlatform
+        SecretType                 = $AccSecretType
+
+        # Account status
+        CPMStatus                  = $Acc.secretManagement.status
+        CPMStatusReason            = $Acc.secretManagement.lastModifiedError
+        AutoManagement             = $Acc.secretManagement.automaticManagementEnabled
+        ManualManagementReason     = $Acc.secretManagement.manualManagementReason
+        LastModifiedTime           = $LastModifiedTime
+        LastVerifiedTime           = $LastVerifiedTime
+        LastReconciledTime         = $LastReconciledTime
+        CreatedTime                = $CreatedTime
+
+        # Remote machine access
+        RemoteMachinesAccess       = $Acc.remoteMachinesAccess.remoteMachines
+        AccessRestrictedToRemote   = $Acc.remoteMachinesAccess.accessRestrictedToRemoteMachines
+
+        # Safe information
+        SafeName                   = $AccSafeName
+        SafeDescription            = $SafeDescription
+        SafeManagingCPM            = $SafeManagingCPM
+        SafeLocation               = $SafeLocation
+        SafeOLACEnabled            = $SafeOlacEnabled
+        SafeRetentionDays          = $SafeRetentionDays
+        SafeAutoPurgeEnabled       = $SafeAutoPurge
+        SafeCreatorName            = $SafeCreatorName
+
+        # Password retrieval result
+        RetrievalStatus            = $Status
+        Password                   = $Password
+    })
+}
+
+# ---------------------------------------------------------------------------
+# CSV EXPORT
+# ---------------------------------------------------------------------------
+Write-Log "Writing output files" -Level SECTION
+
+try {
+    $SummaryRows | Export-Csv -Path $SummaryCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "Summary CSV written: $SummaryCsv" -Level SUCCESS
+} catch {
+    Write-Log "Failed to write summary CSV: $($_.Exception.Message)" -Level ERROR
+}
+
+# ---------------------------------------------------------------------------
+# FINAL SUMMARY
+# ---------------------------------------------------------------------------
+Write-Log "Retrieval complete" -Level SECTION
+Write-Log "Total accounts processed   : $($AllAccounts.Count)" -Level INFO
+Write-Log "Passwords retrieved        : $CountSuccess" -Level INFO
+Write-Log "No permission (skipped)    : $CountNoPermission" -Level INFO
+Write-Log "Dual control required      : $CountDualControl" -Level INFO
+Write-Log "Failed (API error)         : $CountFailed" -Level INFO
+Write-Log "Output CSV                 : $SummaryCsv" -Level INFO
+Write-Log "Log                        : $LogFile" -Level INFO
+Write-Log "REMINDER: Output CSV contains plaintext passwords — protect and delete after use" -Level WARN
