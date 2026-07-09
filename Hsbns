@@ -1,9 +1,13 @@
 # CyberArk_AccountPasswordRetrieval.ps1
 #
-# Authenticates, fetches all accounts the API user has access to,
-# and retrieves the password for each account where permitted.
-# Token is automatically refreshed every 15 minutes to prevent
-# cakwt001E invalid JWT token errors on long-running executions.
+# Authenticates via OAuth2 client_credentials, fetches all accounts the API
+# user has access to, and retrieves the password for each account where permitted.
+#
+# Token is refreshed automatically every 20 minutes during both the accounts
+# pagination loop and the password retrieval loop.
+#
+# Password retrieve endpoint: POST /Accounts/{ID}/Password/Retrieve/
+# Docs: docs.cyberark.com/privilege-cloud-shared-services/latest
 #
 # IMPORTANT: Output CSV contains plaintext passwords — protect and delete after use.
 
@@ -18,11 +22,11 @@ $Subdomain         = "XXXXXXXXXXXXXXXXXXXXXX"
 $IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
 $PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
 
-# Token refresh interval in minutes — refresh before the token expires
-$TokenRefreshMinutes = 15
+# Refresh token every 20 minutes — token lifetime is 30 minutes
+$TokenRefreshMinutes = 20
 
 # ---------------------------------------------------------------------------
-# OUTPUT SETUP
+# OUTPUT
 # ---------------------------------------------------------------------------
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutputDir = ".\CyberArkPasswords_$Timestamp"
@@ -32,9 +36,10 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 # ---------------------------------------------------------------------------
 # AUTHENTICATION
-# Shared function used for initial auth and mid-run token refresh
+# Called at start and whenever the token approaches expiry.
+# Updates the script-scoped $Headers and $TokenIssuedAt on every call.
 # ---------------------------------------------------------------------------
-function Get-AuthHeaders {
+function Invoke-Auth {
     try {
         $Resp = Invoke-RestMethod `
             -Uri "$IdentityUrl/oauth2/platformtoken" `
@@ -47,51 +52,90 @@ function Get-AuthHeaders {
             -ContentType "application/x-www-form-urlencoded" `
             -ErrorAction Stop
 
-        $script:TokenIssuedAt = Get-Date
-        Write-Host "Token issued at $($script:TokenIssuedAt.ToString('HH:mm:ss'))" -ForegroundColor Green
-        return @{
+        $script:Headers = @{
             Authorization  = "Bearer $($Resp.access_token)"
             "Content-Type" = "application/json"
         }
+        $script:TokenIssuedAt = Get-Date
+        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Token issued" -ForegroundColor Green
+
     } catch {
         Write-Host "Authentication failed: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
     }
 }
 
-$Headers      = Get-AuthHeaders
-$TokenIssuedAt = Get-Date
+# ---------------------------------------------------------------------------
+# TOKEN REFRESH CHECK
+# Call before any API request inside a long-running loop.
+# ---------------------------------------------------------------------------
+function Invoke-TokenRefreshIfNeeded {
+    if ((Get-Date) -gt $script:TokenIssuedAt.AddMinutes($TokenRefreshMinutes)) {
+        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Token approaching expiry — refreshing" -ForegroundColor Cyan
+        Invoke-Auth
+    }
+}
+
+# ---------------------------------------------------------------------------
+# INITIAL AUTHENTICATION
+# ---------------------------------------------------------------------------
+Invoke-Auth
 
 # ---------------------------------------------------------------------------
 # FETCH ALL ACCOUNTS (PAGINATED)
+# Docs: GET /Accounts?limit={limit}&offset={offset}
+# Max limit per page is 1000. Response: { value: [...], count: N }
+# Pagination terminates when the returned batch is smaller than the page size.
+# Token refresh is checked before every page request.
 # ---------------------------------------------------------------------------
 $AllAccounts = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Offset      = 0
 $Limit       = 100
 
+Write-Host "Fetching accounts..." -ForegroundColor Cyan
+
 do {
-    $Resp  = Invoke-RestMethod -Uri "$PvwaBase/Accounts?limit=$Limit&offset=$Offset" -Headers $Headers
-    $Batch = $Resp.value
-    if (-not $Batch) { break }
-    foreach ($Acc in $Batch) { $AllAccounts.Add($Acc) }
-    $Offset += $Limit
+    Invoke-TokenRefreshIfNeeded
+
+    try {
+        $Resp = Invoke-RestMethod `
+            -Uri "$PvwaBase/Accounts?limit=$Limit&offset=$Offset" `
+            -Method GET `
+            -Headers $script:Headers `
+            -ErrorAction Stop
+
+        $Batch = $Resp.value
+
+        if (-not $Batch -or $Batch.Count -eq 0) { break }
+
+        foreach ($Acc in $Batch) { $AllAccounts.Add($Acc) }
+
+        Write-Host "  Offset $Offset — fetched $($Batch.Count) (total: $($AllAccounts.Count))" -ForegroundColor DarkGray
+
+        $Offset += $Limit
+
+    } catch {
+        $StatusCode = $null
+        if ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+        Write-Host "Error fetching accounts at offset $Offset — HTTP $StatusCode : $($_.Exception.Message)" -ForegroundColor Red
+        break
+    }
+
 } while ($Batch.Count -eq $Limit)
 
-Write-Host "Accounts found: $($AllAccounts.Count)" -ForegroundColor Cyan
+Write-Host "Total accounts fetched: $($AllAccounts.Count)" -ForegroundColor Cyan
 
 # ---------------------------------------------------------------------------
 # RETRIEVE PASSWORDS
-# Refreshes token automatically if more than $TokenRefreshMinutes have passed
+# Docs: POST /Accounts/{accountId}/Password/Retrieve/
+# Body parameters are all optional. Returns the password as a plain string.
+# 403 = no retrieveAccounts permission on the safe — not treated as an error.
+# Token refresh is checked before every retrieval request.
 # ---------------------------------------------------------------------------
 $Rows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 foreach ($Acc in $AllAccounts) {
-
-    # Refresh token if it is approaching expiry
-    if ((Get-Date) -gt $TokenIssuedAt.AddMinutes($TokenRefreshMinutes)) {
-        Write-Host "Token age exceeded ${TokenRefreshMinutes}min — refreshing" -ForegroundColor Cyan
-        $Headers = Get-AuthHeaders
-    }
+    Invoke-TokenRefreshIfNeeded
 
     $Password = ""
     $Status   = ""
@@ -100,15 +144,23 @@ foreach ($Acc in $AllAccounts) {
         $Password = Invoke-RestMethod `
             -Uri "$PvwaBase/Accounts/$($Acc.id)/Password/Retrieve/" `
             -Method POST `
-            -Headers $Headers `
+            -Headers $script:Headers `
             -Body "{}" `
             -ErrorAction Stop
+
         $Status = "Retrieved"
         Write-Host "Retrieved  : $($Acc.name) | $($Acc.safeName)" -ForegroundColor Green
+
     } catch {
         $StatusCode = $null
         if ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
-        $Status = if ($StatusCode -eq 403) { "NoPermission" } else { "Failed" }
+
+        $Status = switch ($StatusCode) {
+            403     { "NoPermission" }
+            404     { "NotFound" }
+            default { "Failed-HTTP$StatusCode" }
+        }
+
         Write-Host "$Status : $($Acc.name) | $($Acc.safeName)" -ForegroundColor Yellow
     }
 
@@ -129,5 +181,5 @@ foreach ($Acc in $AllAccounts) {
 # EXPORT
 # ---------------------------------------------------------------------------
 $Rows | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-Write-Host "Done — output: $OutputCsv" -ForegroundColor Green
+Write-Host "Done — $($Rows.Count) rows written to: $OutputCsv" -ForegroundColor Green
 Write-Host "REMINDER: CSV contains plaintext passwords — delete after use" -ForegroundColor Yellow
